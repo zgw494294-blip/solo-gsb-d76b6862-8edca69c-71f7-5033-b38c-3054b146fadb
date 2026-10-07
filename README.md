@@ -27,6 +27,7 @@ python app.py
 - **粘贴即运行**：代码写入临时文件，在独立子进程（`python -u`）中执行，启动后立即返回运行标识 `run_id`。
 - **实时对话**：可向子进程标准输入发送一行文本，或关闭标准输入（EOF）；关闭后再次写入会被拒绝（HTTP 409）。
 - **自动对话模式**：提交代码、步骤 JSON 数组和总时限（秒），后端按步骤自动等待指定 stdout/stderr 文本、发送单行、关闭标准输入，立即返回 `run_id`；详见下文「自动对话模式」。
+- **输出文件取回**：`POST /run`、`POST /auto` 可带 `outputs` 数组声明工作目录中的输出文件名（省略为 `[]`，最多 10 个互异非空字符串）；运行结束后经 HTTP 查清单、按原始字节下载，每个文件最多 1 MiB。详见下文「输出文件取回」。
 - **双路分栏输出**：stdout / stderr 分别按 UTF-8 **增量解码**并分栏增量呈现——未换行的片段也立即显示，跨读边界的多字节字符会被补齐，不丢字、不乱码。
 - **互不阻塞**：两路输出各由独立线程读取；程序等待输入或一路无输出时，另一路输出、状态查询和终止请求仍可正常处理。
 - **全站单运行**：同时仅允许一个未结束运行（含自动对话运行及其收尾阶段）；运行中再次提交会收到 409。
@@ -139,6 +140,73 @@ curl -s "localhost:8000/events?run_id=$RUN&after=0"
   {"action": "wait", "stream": "stdout", "text": "共收到"}
 ]
 ```
+
+## 输出文件取回
+
+程序写入其工作目录（运行的临时目录）的文件可在运行结束后从页面或 HTTP 取回。
+
+### 声明
+
+`POST /run` 与 `POST /auto` 的请求体可带 `outputs` 字段，**省略等价于 `[]`**：
+
+- 必须是数组，最多 **10** 个**互异非空字符串**；
+- 名称不得为 `.` 或 `..`，不得含斜杠 `/`、反斜杠 `\` 或 NUL（即只允许工作目录下的平面文件名）；
+- 参数非法返回 **400**，且**不启动、不替换**当前运行（槽位中已有的运行不受影响）。
+
+### 收集与状态
+
+运行收尾时（两路 stdout/stderr 输出排空、进程回收之后，自动运行还包括脚本收尾公布结果），**在删除临时目录之前**按声明顺序收集文件：
+
+- 仅收集**非符号链接的普通文件**的**原始字节**（不做任何编码转换），每个最多 **1 MiB**（恰好 1 MiB 可下载，超出不可下载）；
+- 清单逐项注明状态：
+
+  | status | 含义 |
+  | --- | --- |
+  | `ok` | 可下载（附 `size`，字节数） |
+  | `missing` | 缺失：运行结束时不存在该文件 |
+  | `not_regular` | 非普通文件：目录、FIFO、套接字、设备文件或符号链接 |
+  | `too_large` | 超过 1 MiB（附实际 `size`） |
+  | `read_error` | 文件存在但读取失败 |
+
+- 文件问题**不改变运行结果**（退出码、自动对话成功/失败/取消均照常公布）；
+- 正常退出、非零退出、被终止（含自动对话失败/取消）一视同仁，只要在被 SIGKILL 前已写入并落盘的文件都能取回；
+- **两路输出排空、进程回收（自动运行还须脚本收尾）之后**才可查清单、下载或重跑：运行未完成时 `GET /outputs`、`GET /output` 返回 **409**；旧 `run_id`（已被新运行替换）同样 **409**；
+- 当前运行未声明 `outputs`、或 `name` 不在声明清单中、或该项不可下载（缺失/非普通文件/超限/读取失败）时下载返回 **404**。
+
+### HTTP 接口
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/outputs?run_id=…` | 按声明顺序返回输出文件清单：`{run_id, exit_code, outputs: [{name, status, size?}]}` |
+| GET | `/output?run_id=…&name=…` | 下载单个可下载文件的原始字节（`application/octet-stream`，不预览内容） |
+
+### 生成二进制文件并取回（调用示例）
+
+下面的程序把 256 个字节值各重复 4 遍写入 `result.bin`（共 1024 字节），并在结束后取回、校验字节完全一致：
+
+```bash
+# 1. 启动运行并声明输出文件（/run 与 /auto 均支持 outputs）
+RUN=$(curl -s localhost:8000/run -H 'Content-Type: application/json' -d '{
+  "code": "open(\"result.bin\", \"wb\").write(bytes(range(256)) * 4)\nprint(\"done\")",
+  "outputs": ["result.bin"]
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['run_id'])")
+
+# 2. 等待两路输出排空、进程回收完成（看到 status=finished、busy=false）
+curl -s "localhost:8000/events?run_id=$RUN&after=0"
+
+# 3. 查清单：status 为 ok 即可下载，size 为字节数
+curl -s "localhost:8000/outputs?run_id=$RUN"
+# {"exit_code":0,"outputs":[{"name":"result.bin","size":1024,"status":"ok"}],"run_id":"…"}
+
+# 4. 按原始字节下载（非 ASCII 文件名需做百分号编码）
+curl -s "localhost:8000/output?run_id=$RUN&name=result.bin" -o result.bin
+
+# 5. 校验取回的字节与程序写出的完全一致
+python3 -c "print(open('result.bin','rb').read() == bytes(range(256))*4)"
+# True
+```
+
+运行未结束时步骤 3/4 返回 409；把文件名换成未声明的名字（或缺失/目录/符号链接/超过 1 MiB 的项），步骤 4 返回 404。页面上「输出文件」区域可直接填写 JSON 数组（如 `["result.bin", "data.json"]`），运行结束后逐项显示状态，`ok` 项提供下载链接（页面不预览文件内容）。
 
 ## 长行复现（回归验证）
 
@@ -338,12 +406,14 @@ curl -s "localhost:8000/events?run_id=$RUN2&after=0"
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/run` | 启动手动运行，立即返回 `run_id`；已有未结束运行时返回 409 |
-| POST | `/auto` | 启动自动对话运行：`{code, steps, timeout}`，立即返回 `run_id`；槽位占用时返回 409，参数非法返回 400 |
+| POST | `/run` | 启动手动运行：`{code, outputs?}`，立即返回 `run_id`；已有未结束运行时返回 409，参数非法返回 400 |
+| POST | `/auto` | 启动自动对话运行：`{code, steps, timeout, outputs?}`，立即返回 `run_id`；槽位占用时返回 409，参数非法返回 400 |
 | GET | `/events?run_id=…&after=…` | 长轮询增量事件（stdout / stderr / meta 退出码 / auto 步骤进展与结果） |
 | POST | `/input` | 发送一行文本；stdin 已关闭或自动对话进行中时返回 409 |
 | POST | `/stdin/close` | 关闭标准输入（EOF）；自动对话进行中时返回 409 |
 | POST | `/terminate` | SIGKILL 立即终止；自动对话运行同时取消脚本 |
+| GET | `/outputs?run_id=…` | 输出文件清单（按声明顺序，逐项 `ok` / `missing` / `not_regular` / `too_large` / `read_error`）；未完成或旧 run_id 返回 409 |
+| GET | `/output?run_id=…&name=…` | 下载单个可下载输出文件的原始字节；未声明或不可下载返回 404，未完成或旧 run_id 返回 409 |
 | GET | `/status` | 查询当前运行状态（含自动对话状态与结果） |
 
 ## 安全说明

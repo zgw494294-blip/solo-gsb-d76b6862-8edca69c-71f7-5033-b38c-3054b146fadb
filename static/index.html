@@ -22,6 +22,7 @@
     padding: 10px; tab-size: 4;
   }
   #steps { height: 120px; }
+  #outputs { height: 60px; margin-top: 8px; }
   .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 8px; }
   button {
     background: #2b6cb0; color: #fff; border: 0; border-radius: 6px;
@@ -54,6 +55,14 @@
     border-radius: 6px; padding: 8px 10px; font-size: 13px;
   }
   .hint { color: #7c828c; font-size: 12px; }
+  #outputList { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+  #outputList:empty { margin: 0; }
+  #outputList li { display: flex; flex-wrap: wrap; gap: 8px; align-items: baseline; }
+  #outputList .fname { font-family: "SF Mono", Consolas, "Courier New", monospace; color: #d7dae0; word-break: break-all; }
+  #outputList .fstatus { font-size: 12px; }
+  #outputList .ok { color: #8fd3a0; }
+  #outputList .bad { color: #f0a8a0; }
+  #outputList a { color: #63b3ed; }
 </style>
 </head>
 <body>
@@ -92,6 +101,16 @@
     <span class="hint">使用上方代码框中的程序；运行期间手动输入与 EOF 被禁用（409），「终止」会取消脚本。</span>
   </div>
   <div id="autoStatus"></div>
+</section>
+
+<section class="card">
+  <h2>输出文件（可选）</h2>
+  <textarea id="outputs" spellcheck="false" placeholder='运行结束后要取回的工作目录文件名 JSON 数组（最多 10 个，互异；不含路径分隔符）。例：
+["result.bin", "data.json"]'></textarea>
+  <div class="toolbar">
+    <span class="hint">仅收集非符号链接的普通文件，每个最多 1 MiB；运行结束后在这里查看状态并下载，不预览内容。</span>
+  </div>
+  <ul id="outputList"></ul>
 </section>
 
 <section id="panes">
@@ -138,6 +157,69 @@ function setStdinOpen(open) {
 function appendText(el, text) {
   el.appendChild(document.createTextNode(text));  // 未换行片段也直接追加
   el.scrollTop = el.scrollHeight;
+}
+
+// 读取并解析输出文件 JSON 输入：省略或空白视为 []，解析失败返回 null
+function readOutputsInput() {
+  const raw = $("outputs").value.trim();
+  if (!raw) return [];
+  try {
+    const arr = JSON.parse(raw);
+    if (!Array.isArray(arr) ||
+        !arr.every(n => typeof n === "string" && n.length > 0)) {
+      return null;
+    }
+    return arr;
+  } catch (e) {
+    return null;
+  }
+}
+
+function clearOutputs() { $("outputList").textContent = ""; }
+
+const OUTPUT_STATUS_TEXT = {
+  ok: n => `可下载（${n} 字节）`,
+  missing: () => "缺失：运行结束时不存在该文件",
+  not_regular: () => "非普通文件：仅可取回非符号链接的普通文件",
+  too_large: n => `超过 1 MiB 上限（${n} 字节），不可下载`,
+  read_error: () => "读取失败"
+};
+
+function formatBytes(n) {
+  if (n == null) return "";
+  if (n < 1024) return String(n);
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + " KiB";
+  return (n / (1024 * 1024)).toFixed(2) + " MiB";
+}
+
+// 运行结束后拉取输出文件清单，逐项显示状态；可下载项给下载链接（不预览内容）
+async function renderOutputs(runId) {
+  const ul = $("outputList");
+  ul.textContent = "";
+  const res = await fetch(`/outputs?run_id=${encodeURIComponent(runId)}`);
+  if (res.status === 409) return false;  // 尚未收尾完成，稍后由调用方重试
+  if (!res.ok) return true;
+  const data = await res.json();
+  for (const item of data.outputs || []) {
+    const li = document.createElement("li");
+    const name = document.createElement("span");
+    name.className = "fname";
+    name.textContent = item.name;
+    const status = document.createElement("span");
+    const desc = OUTPUT_STATUS_TEXT[item.status];
+    status.textContent = desc ? desc(formatBytes(item.size)) : item.status;
+    status.className = "fstatus " + (item.status === "ok" ? "ok" : "bad");
+    li.append(name, status);
+    if (item.status === "ok") {
+      const a = document.createElement("a");
+      a.textContent = "⬇ 下载";
+      a.href = `/output?run_id=${encodeURIComponent(runId)}&name=${encodeURIComponent(item.name)}`;
+      a.download = item.name;
+      li.appendChild(a);
+    }
+    ul.appendChild(li);
+  }
+  return true;
 }
 
 function renderAuto(d) {
@@ -206,6 +288,7 @@ async function pollLoop(runId, myEpoch) {
       if (!data.events.some(e => e.stream === "meta")) {
         setStatus("运行结束，退出码 = " + data.exit_code + "（两路输出已排空，可重新运行）");
       }
+      while (myEpoch === epoch && !(await renderOutputs(runId))) await sleep(200);
       return;
     }
   }
@@ -219,6 +302,7 @@ function adoptRun(runId, isAuto) {
   $("out").textContent = "";
   $("err").textContent = "";
   $("autoStatus").textContent = "";
+  clearOutputs();
   setRunning(true);
   if (autoRunning) setStdinOpen(false);
   setStatus("运行中，run_id = " + runId.slice(0, 8) + "…");
@@ -228,13 +312,18 @@ function adoptRun(runId, isAuto) {
 async function startRun() {
   const code = $("code").value;
   if (!code.trim()) { setStatus("请先粘贴代码"); return; }
+  const outputs = readOutputsInput();
+  if (outputs === null) {
+    setStatus("输出文件 JSON 无效：请填写互异非空文件名字符串数组，或留空");
+    return;
+  }
   const res = await fetch("/run", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({code})
+    body: JSON.stringify({code, outputs})
   });
-  if (res.status === 409) {
-    const d = await res.json();
-    setStatus("无法启动：" + (d.error || "已有运行未结束"));
+  if (!res.ok) {
+    const d = await res.json().catch(() => ({}));
+    setStatus("无法启动：" + (d.error || ("HTTP " + res.status)));
     return;
   }
   const data = await res.json();
@@ -253,10 +342,17 @@ async function startAuto() {
     $("autoStatus").textContent = "步骤 JSON 解析失败：" + e.message;
     return;
   }
+  const outputs = readOutputsInput();
+  if (outputs === null) {
+    renderAuto(null);
+    $("autoStatus").style.color = "#f0a8a0";
+    $("autoStatus").textContent = "输出文件 JSON 无效：请填写互异非空文件名字符串数组，或留空";
+    return;
+  }
   const timeout = Number($("timeout").value);
   const res = await fetch("/auto", {
     method: "POST", headers: {"Content-Type": "application/json"},
-    body: JSON.stringify({code, steps, timeout})
+    body: JSON.stringify({code, steps, timeout, outputs})
   });
   if (!res.ok) {
     const d = await res.json().catch(() => ({}));
@@ -411,6 +507,7 @@ $("line").addEventListener("keydown", e => { if (e.key === "Enter") sendLine(); 
     } else if (data.state === "finished") {
       setStatus("上一次运行已结束，退出码 = " + data.exit_code + "，可直接运行新代码");
       if (data.auto && data.auto.result) renderAuto(data.auto.result);
+      await renderOutputs(data.run_id);
     }
   } catch (e) { /* 忽略 */ }
 })();
