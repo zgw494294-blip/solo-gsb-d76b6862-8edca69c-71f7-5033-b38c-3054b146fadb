@@ -20,6 +20,14 @@
   记录当前步骤下标与原因、停止后续步骤、终止尚存进程，结果公布与重跑都
   等到输出排空、进程回收、脚本停止之后；旧脚本只持有旧运行对象，
   操作不到新运行。
+- 输出文件取回：/run 与 /auto 可带 outputs 文件名数组（省略为 []；最多
+  10 个互异非空名称，不得为 . 或 ..，不得含斜杠、反斜杠及 NUL；非法
+  请求 400，不启动也不替换当前运行）。运行结束时——两路输出排空、进程
+  回收之后，删除临时目录之前——按声明顺序收集工作目录里的同名文件：
+  仅收集非符号链接的普通文件，每个最多 1 MiB，逐项记录可下载 / 缺失 /
+  非普通文件 / 超限 / 读取失败，文件问题不影响运行结果。自动对话运行
+  须再等脚本收尾公布结果；此后 GET /files 查清单、GET /files/<名称>
+  下载原始字节，未完成 409，未声明或不可下载 404，旧 run_id 一律 409。
 - 全站同时仅一个未结束运行；旧 run_id 对新进程一律无效。
 - 正常退出与主动终止（SIGKILL，不等程序自行退出）都会先排空两路输出、
   回收进程，之后才公布退出码并允许重跑。
@@ -27,9 +35,11 @@
 """
 
 import codecs
+import io
 import os
 import select
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,7 +47,7 @@ import threading
 import time
 import uuid
 
-from flask import Flask, jsonify, request, send_from_directory
+from flask import Flask, jsonify, request, send_file, send_from_directory
 
 app = Flask(__name__, static_folder="static", static_url_path="")
 
@@ -52,14 +62,21 @@ MAX_WAIT_TEXT = 10000      # 单条等待文本的最大长度（字符）
 MAX_LINE = 1000000         # 单行发送的最大长度（字符）
 MAX_TIMEOUT = 3600         # 自动对话总时限上限（秒）
 
+MAX_OUTPUTS = 10               # 最多声明的输出文件数
+MAX_OUTPUT_SIZE = 1024 * 1024  # 单个输出文件最多收集的字节数（1 MiB）
+
 _state_lock = threading.Lock()
 _current_run = None        # 当前（可能是唯一未结束的）运行
 
 
 class Run:
-    """一次子进程运行：两路输出增量解码成事件流，退出码最后公布。"""
+    """一次子进程运行：两路输出增量解码成事件流，退出码最后公布。
 
-    def __init__(self, code, steps=None, timeout=None):
+    outputs 为声明的输出文件名（程序写入工作目录、需要取回的文件）；
+    运行结束时按声明顺序收集原始字节，逐项状态存入 files。
+    """
+
+    def __init__(self, code, steps=None, timeout=None, outputs=None):
         self.id = uuid.uuid4().hex
         self.events = []            # [{seq, stream, data}]，seq 从 1 递增
         self.seq = 0
@@ -71,6 +88,9 @@ class Run:
         self.exit_code = None
         self.stdin_closed = False
         self.auto = None            # 自动对话脚本（手动模式为 None）
+        self.outputs = outputs or []    # 声明的输出文件名（按声明顺序收集）
+        self.files = []             # [{name, status, size, data}]，结束后填充
+        self.files_ready = False    # 输出文件是否已收集完毕
 
         self.tmpdir = tempfile.mkdtemp(prefix="webrun_")
         self.script = os.path.join(self.tmpdir, "main.py")
@@ -135,7 +155,11 @@ class Run:
         for t in self.pumps:
             t.join()
         code = self.proc.wait()
+        # 删除临时目录之前按声明顺序收集输出文件；文件问题不影响运行结果
+        files = self._collect_files()
         with self.cond:
+            self.files = files
+            self.files_ready = True
             self.exit_code = code
             self.state = STATE_FINISHED
             self.seq += 1
@@ -143,6 +167,39 @@ class Run:
                                 "data": {"exit_code": code}})
             self.cond.notify_all()
         shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _collect_files(self):
+        """按声明顺序收集输出文件的原始字节，返回逐项结果列表。
+
+        只收集非符号链接的普通文件，每个最多 1 MiB；缺失、非普通文件、
+        超限或读取失败都逐项记录（data 为 None），绝不影响运行结果。
+        须在删除临时目录之前调用。
+        """
+        files = []
+        for name in self.outputs:
+            entry = {"name": name, "status": "ok", "size": 0, "data": None}
+            path = os.path.join(self.tmpdir, name)
+            try:
+                # lstat 不跟随符号链接：符号链接一律按非普通文件处理
+                st = os.lstat(path)
+                if not stat.S_ISREG(st.st_mode):
+                    entry["status"] = "not_regular"
+                elif st.st_size > MAX_OUTPUT_SIZE:
+                    entry["status"] = "too_large"
+                else:
+                    with open(path, "rb") as f:
+                        data = f.read(MAX_OUTPUT_SIZE + 1)
+                    if len(data) > MAX_OUTPUT_SIZE:   # 读取期间文件被写大
+                        entry["status"] = "too_large"
+                    else:
+                        entry["size"] = len(data)
+                        entry["data"] = data
+            except FileNotFoundError:
+                entry["status"] = "missing"
+            except OSError:
+                entry["status"] = "unreadable"
+            files.append(entry)
+        return files
 
     def slot_busy(self):
         """单运行槽位是否仍被占用：进程未结束，或自动脚本尚未公布结果。"""
@@ -476,6 +533,29 @@ def _validate_steps(steps):
     return None
 
 
+def _validate_outputs(outputs):
+    """校验 outputs 输出文件声明；合法（含省略为 None）返回 None。"""
+    if outputs is None:
+        return None
+    if not isinstance(outputs, list):
+        return "outputs 必须是文件名数组"
+    if len(outputs) > MAX_OUTPUTS:
+        return "输出文件过多（最多 %d 个）" % MAX_OUTPUTS
+    seen = set()
+    for i, name in enumerate(outputs):
+        where = "输出文件 %d：" % (i + 1)
+        if not isinstance(name, str) or not name:
+            return where + "名称必须是非空字符串"
+        if name in (".", ".."):
+            return where + "名称不能是 . 或 .."
+        if "/" in name or "\\" in name or "\x00" in name:
+            return where + "名称不能包含斜杠、反斜杠或 NUL"
+        if name in seen:
+            return where + "名称重复"
+        seen.add(name)
+    return None
+
+
 def _get_run(run_id):
     """只有与当前运行匹配的 run_id 才有效；旧标识控制不了新进程。"""
     with _state_lock:
@@ -507,13 +587,17 @@ def index():
 @app.post("/run")
 def start_run():
     global _current_run
-    code = (request.get_json(force=True, silent=True) or {}).get("code", "")
+    data = request.get_json(force=True, silent=True) or {}
+    code = data.get("code", "")
     if not code.strip():
         return jsonify({"error": "代码为空"}), 400
+    error = _validate_outputs(data.get("outputs"))
+    if error is not None:
+        return jsonify({"error": error}), 400
     with _state_lock:
         if _slot_busy():
             return jsonify({"error": "已有运行未结束，请先终止"}), 409
-        run = Run(code)
+        run = Run(code, outputs=data.get("outputs") or [])
         _current_run = run
     # 子进程已启动，立即返回运行标识
     return jsonify({"run_id": run.id})
@@ -535,10 +619,14 @@ def start_auto():
             or not 0 < timeout <= MAX_TIMEOUT):
         return jsonify(
             {"error": "timeout 必须是 0~%d 秒之间的数字" % MAX_TIMEOUT}), 400
+    error = _validate_outputs(data.get("outputs"))
+    if error is not None:
+        return jsonify({"error": error}), 400
     with _state_lock:
         if _slot_busy():
             return jsonify({"error": "已有运行未结束，请先终止"}), 409
-        run = Run(code, steps=data["steps"], timeout=float(timeout))
+        run = Run(code, steps=data["steps"], timeout=float(timeout),
+                  outputs=data.get("outputs") or [])
         _current_run = run
     # 子进程与脚本线程已启动，立即返回运行标识
     return jsonify({"run_id": run.id})
@@ -626,6 +714,56 @@ def status():
     if auto is not None:
         data["auto"] = auto
     return jsonify(data)
+
+
+_FILE_STATUS_TEXT = {
+    "missing": "缺失",
+    "not_regular": "非普通文件",
+    "too_large": "超过 1 MiB",
+    "unreadable": "读取失败",
+}
+
+
+def _files_not_ready(run):
+    """输出文件是否还不可取：运行未结束，或自动脚本尚未公布结果。"""
+    with run.cond:
+        return run.slot_busy() or not run.files_ready
+
+
+@app.get("/files")
+def list_files():
+    """输出文件清单：按声明顺序列出每项的名称、状态与大小。"""
+    run = _get_run(request.args.get("run_id", ""))
+    if run is None:
+        return jsonify({"error": "运行标识已失效"}), 409
+    if _files_not_ready(run):
+        return jsonify({"error": "运行未结束，输出文件尚未收集"}), 409
+    with run.cond:
+        files = [{"name": e["name"], "status": e["status"], "size": e["size"]}
+                 for e in run.files]
+    return jsonify({"run_id": run.id, "files": files})
+
+
+@app.get("/files/<name>")
+def download_file(name):
+    """下载某个已声明且可下载的输出文件（原始字节，不在页面预览）。"""
+    run = _get_run(request.args.get("run_id", ""))
+    if run is None:
+        return jsonify({"error": "运行标识已失效"}), 409
+    if _files_not_ready(run):
+        return jsonify({"error": "运行未结束，输出文件尚未收集"}), 409
+    with run.cond:
+        entry = next((e for e in run.files if e["name"] == name), None)
+    if entry is None:
+        return jsonify({"error": "本次运行未声明该输出文件"}), 404
+    if entry["status"] != "ok":
+        return jsonify({"error": "该文件不可下载（%s）"
+                        % _FILE_STATUS_TEXT.get(entry["status"],
+                                                entry["status"]),
+                        "status": entry["status"]}), 404
+    return send_file(io.BytesIO(entry["data"]),
+                     mimetype="application/octet-stream",
+                     as_attachment=True, download_name=name)
 
 
 if __name__ == "__main__":

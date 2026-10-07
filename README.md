@@ -1,6 +1,6 @@
 # Python 实时对话运行器
 
-用 Flask + 原生 HTML/CSS/JavaScript 实现的网页：粘贴 Python 代码后在独立子进程中执行，并与它实时对话。
+用 Flask + 原生 HTML/CSS/JavaScript 实现的网页：粘贴 Python 代码后在独立子进程中执行，与它实时对话，并取回程序写入工作目录的输出文件。
 
 ## 启动（单条命令）
 
@@ -27,6 +27,7 @@ python app.py
 - **粘贴即运行**：代码写入临时文件，在独立子进程（`python -u`）中执行，启动后立即返回运行标识 `run_id`。
 - **实时对话**：可向子进程标准输入发送一行文本，或关闭标准输入（EOF）；关闭后再次写入会被拒绝（HTTP 409）。
 - **自动对话模式**：提交代码、步骤 JSON 数组和总时限（秒），后端按步骤自动等待指定 stdout/stderr 文本、发送单行、关闭标准输入，立即返回 `run_id`；详见下文「自动对话模式」。
+- **取回输出文件**：`POST /run` 与 `POST /auto` 可带 `outputs` 文件名数组（省略为 `[]`）；运行结束时按声明顺序收集程序写入工作目录的文件（仅非符号链接的普通文件，每个最多 1 MiB），逐项报告可下载 / 缺失 / 非普通文件 / 超限 / 读取失败，页面列出状态并提供下载链接（不预览内容）；详见下文「取回输出文件」。
 - **双路分栏输出**：stdout / stderr 分别按 UTF-8 **增量解码**并分栏增量呈现——未换行的片段也立即显示，跨读边界的多字节字符会被补齐，不丢字、不乱码。
 - **互不阻塞**：两路输出各由独立线程读取；程序等待输入或一路无输出时，另一路输出、状态查询和终止请求仍可正常处理。
 - **全站单运行**：同时仅允许一个未结束运行（含自动对话运行及其收尾阶段）；运行中再次提交会收到 409。
@@ -139,6 +140,45 @@ curl -s "localhost:8000/events?run_id=$RUN&after=0"
   {"action": "wait", "stream": "stdout", "text": "共收到"}
 ]
 ```
+
+## 取回输出文件
+
+程序写入**工作目录**（子进程的当前目录，即临时目录）的文件可以在运行结束后取回：启动时在 `outputs` 中声明文件名，结束后通过 HTTP 查清单、下载原始字节；页面「输出文件」区域也会列出每项状态与下载链接（不预览内容）。
+
+### 声明规则
+
+- `POST /run` 与 `POST /auto` 都可带 `outputs` 数组，省略为 `[]`；
+- 最多 **10 个**互异的非空字符串；名称不得为 `.` 或 `..`，不得含斜杠、反斜杠及 NUL；
+- 非法请求返回 **400**，不会启动也不会替换当前运行。
+
+### 收集与状态
+
+- 运行结束时（两路输出排空、进程回收之后，删除临时目录之前）按**声明顺序**收集原始字节；自动对话运行还要等脚本收尾公布结果后，才可下载或重跑——正常、失败和终止均适用；
+- 仅收集**非符号链接的普通文件**，每个最多 **1 MiB**；
+- 逐项状态：`ok` 可下载 / `missing` 缺失 / `not_regular` 非普通文件 / `too_large` 超过 1 MiB / `unreadable` 读取失败；文件问题**不影响**运行结果（退出码与自动对话结果不变）。
+
+### 调用示例：生成二进制文件并取回
+
+```bash
+# 程序在工作目录写出 256 字节的二进制文件 result.bin
+RUN=$(curl -s localhost:8000/run -H 'Content-Type: application/json' -d '{
+  "code": "with open(\"result.bin\", \"wb\") as f:\n    f.write(bytes(range(256)))\nprint(\"written\", flush=True)",
+  "outputs": ["result.bin"]
+}' | python3 -c "import sys,json;print(json.load(sys.stdin)['run_id'])")
+
+# 等运行结束：看到 meta 退出事件时文件已收集（自动对话运行须等到 auto 结果事件）
+curl -s "localhost:8000/events?run_id=$RUN&after=0"
+
+# 查看清单：每项的名称、状态与大小
+curl -s "localhost:8000/files?run_id=$RUN"
+# => {"run_id": "…", "files": [{"name": "result.bin", "status": "ok", "size": 256}]}
+
+# 下载可用项（原始字节，按 Content-Disposition 存为 result.bin）
+curl -sOJ "localhost:8000/files/result.bin?run_id=$RUN"
+python3 -c "assert open('result.bin','rb').read() == bytes(range(256)); print('OK')"
+```
+
+未完成（含自动脚本收尾中）查询或下载返回 **409**；当前运行未声明或不可下载的名称返回 **404**；旧 `run_id` 一律返回 **409**。
 
 ## 长行复现（回归验证）
 
@@ -338,13 +378,15 @@ curl -s "localhost:8000/events?run_id=$RUN2&after=0"
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/run` | 启动手动运行，立即返回 `run_id`；已有未结束运行时返回 409 |
-| POST | `/auto` | 启动自动对话运行：`{code, steps, timeout}`，立即返回 `run_id`；槽位占用时返回 409，参数非法返回 400 |
+| POST | `/run` | 启动手动运行：`{code}`，可带 `outputs` 声明输出文件；立即返回 `run_id`；已有未结束运行时返回 409，参数非法返回 400 |
+| POST | `/auto` | 启动自动对话运行：`{code, steps, timeout}`，可带 `outputs`；立即返回 `run_id`；槽位占用时返回 409，参数非法返回 400 |
 | GET | `/events?run_id=…&after=…` | 长轮询增量事件（stdout / stderr / meta 退出码 / auto 步骤进展与结果） |
 | POST | `/input` | 发送一行文本；stdin 已关闭或自动对话进行中时返回 409 |
 | POST | `/stdin/close` | 关闭标准输入（EOF）；自动对话进行中时返回 409 |
 | POST | `/terminate` | SIGKILL 立即终止；自动对话运行同时取消脚本 |
 | GET | `/status` | 查询当前运行状态（含自动对话状态与结果） |
+| GET | `/files?run_id=…` | 输出文件清单（按声明顺序列出名称、状态、大小）；运行未结束或旧 `run_id` 返回 409 |
+| GET | `/files/<名称>?run_id=…` | 下载某个可下载项的原始字节；未声明或不可下载返回 404，未结束或旧标识返回 409 |
 
 ## 安全说明
 
